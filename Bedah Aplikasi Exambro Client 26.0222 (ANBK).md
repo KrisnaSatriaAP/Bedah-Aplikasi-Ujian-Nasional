@@ -127,7 +127,7 @@ Metode layanan WCF yang terlihat: `SubmitWorkstation`, `SubmitWorkstationV3`, `U
 - [ ] HTTPS (443) ke `anbk-siswa`, `anbk-layanan`, dan `smart-production` di domain Pusmendik (kemdikbud dan kemendikdasmen).
 - [ ] DNS resolve normal (error `ENOTFOUND` di log muncul saat DNS atau internet bermasalah).
 - [ ] Jalur semi daring: klien bisa menjangkau server lokal (default `192.168.0.200`, port 443).
-- [ ] Pastikan latensi dan stabilitas baik. Polling 5 menit dan heartbeat 10 menit itu ringan, bandwidth bukan masalah utama.
+- [ ] Pastikan latensi dan stabilitas baik. Traffic aplikasinya ringan (polling dan heartbeat berupa request kecil), jadi bandwidth bukan masalah utama. Interval efektifnya berbeda antar sumber, lihat bagian 12.4.
 - [ ] Verifikasi TLS dimatikan di aplikasi, jadi SSL inspection biasanya tidak mengganggu.
 
 ## 10. Hash SHA-256 binary utama
@@ -146,3 +146,118 @@ Metode layanan WCF yang terlihat: `SubmitWorkstation`, `SubmitWorkstationV3`, `U
 - Analisis statis, tanpa menjalankan aplikasi.
 - Peran binary .NET disimpulkan dari metadata dan string, bukan dari kode hasil dekompilasi.
 - `setting_exambro.json` sengaja tidak didekripsi. Nilai kunci dan password tidak dicantumkan di dokumen ini.
+
+## 12. Panduan troubleshooting jaringan
+
+### 12.1 Peta dependensi jaringan
+
+| Fungsi | Tujuan | Mode | Dipakai oleh | Dampak jika gagal |
+|---|---|---|---|---|
+| Halaman ujian (daring) | `anbk-siswa.pusmendik.kemdikbud.go.id` :443 (log Feb 2026: `…kemendikdasmen.go.id`) | Daring (`moda`=2) | Chromium di `elekbrowser.exe` | Layar error `404.html` berisi kode Chromium |
+| Halaman ujian (lokal) | `https://192.168.0.200/unbk` (login: `/unbk/account/login`) | Semi daring (`moda`=1) | Chromium | Layar error yang sama |
+| Generate User-Agent | `anbk-webapi.pusmendik.kemdikbud.go.id/auth/api/v1/user-agent/generate` | Field `urlgetagent` | Launcher .NET (inferensi dari nama kelas `getAgent`) | Kemungkinan gagal meluncurkan atau ditolak server |
+| Pesan pengawas dan status "kick" | `smart-production.pusmendik.kemdikbud.go.id/api/task-get-pesan/…` dan `…/task-get-status-peserta/…` | Jika `aktifkamera`=1 | Node `request` di proses utama Electron | Log `getapipesan=` dan `writestatusjson=` error; pesan dan kick tidak masuk, ujian tetap berjalan |
+| Heartbeat / registrasi workstation | `192.168.0.200/puspendikunbkservice/CBTservices/WorkstationService.svc` | Semi daring | `ExamServices.exe` (WCF) | Peserta tidak terpantau di server lokal |
+| Cek update | Endpoint tidak teridentifikasi | Saat start | `ExamBrowser.exe` | Baris "Tidak Terkoneksi Internet" di `updatelog.txt` |
+| Snapshot webcam | Endpoint tidak teridentifikasi | `aktifkamera`=1 | `ExamCam.exe` | Belum bisa dipastikan |
+
+Penanda mode terverifikasi dari log: `moda`=2 membuka `anbk-siswa…`, `moda`=1 membuka `192.168.0.x/unbk`.
+
+### 12.2 Tiga tumpukan jaringan yang berbeda
+
+| Tumpukan | Proxy | Validasi TLS |
+|---|---|---|
+| Chromium (halaman ujian) | Mengikuti proxy sistem | Error sertifikat diabaikan |
+| Node `request` (polling pesan/status) | Tidak mengikuti proxy sistem, hanya variabel lingkungan `HTTP_PROXY`/`HTTPS_PROXY` | Dimatikan (`NODE_TLS_REJECT_UNAUTHORIZED=0`) |
+| .NET (launcher, WCF, updater) | Proxy default .NET (pengaturan sistem) | Ikut aturan OS |
+
+Konsekuensinya: di jaringan yang mewajibkan proxy eksplisit tanpa akses langsung ke internet, halaman ujian bisa terbuka normal sementara polling pesan/kick gagal. Gejala "ujian jalan tapi pengawas tidak bisa kirim pesan atau mengeluarkan peserta" mengarah ke jalur Node (DNS, proxy, atau rute langsung).
+
+Polling juga hanya berjalan setelah username peserta terdeteksi (`username` tidak kosong). Kalau tidak pernah muncul baris `datausername{…}` di log, polling tidak aktif sama sekali.
+
+### 12.3 Membaca `Browser.log`
+
+Lokasi: `Application\service\elekbrowser\resources\app\Browser.log`.
+
+| Baris log | Arti | Tindakan |
+|---|---|---|
+| `ReadPesan= / ReadKick= / Readname= … ENOENT` | File JSON belum ada saat start pertama | Normal, abaikan |
+| `CONFIG= {…}` dengan level `[error]` | Hanya dump konfigurasi, bukan kegagalan | Abaikan (tapi log ini membocorkan konfigurasi) |
+| `respone= 200` lalu `dfl=loading close&showpage` lalu `masuk kedalam url` + URL | Urutan sehat, halaman ujian termuat | Tidak ada |
+| `kirim web login` | Fitur kamera aktif | Cocokkan dengan `CAM= 1` |
+| `tidak kirimgambar web login` | Fitur kamera tidak aktif | Cocokkan dengan `aktifkamera` |
+| `datausername{"username":"…","statuskirim":"1"}` | Username terdeteksi, polling aktif | Jika tidak pernah muncul, polling tidak jalan |
+| Baris `null` berulang | Muncul di sesi yang akhirnya sukses, jadi bukan indikator gagal | Abaikan |
+| `getapipesan=Error: getaddrinfo ENOTFOUND <host>` dan `writestatusjson= …` (berpasangan, teramati tiap sekitar 30 detik) | Resolusi DNS gagal untuk host API dari sisi klien | Periksa DNS klien/resolver, bukan firewall |
+| `dfl.errcode=<n> errdesc=…` | `did-fail-load`, layar `404.html` tampil | Lihat tabel 12.3.1 |
+| `dn=…` dengan status 500 | Server mengembalikan 500 | Sisi server, bukan jaringan lokal |
+
+Layar `404.html` menampilkan kode dan deskripsi error. F5 memuat ulang.
+
+#### 12.3.1 Kode error Chromium yang lazim
+
+| Kode | Nama | Arah diagnosa |
+|---|---|---|
+| -105 | `ERR_NAME_NOT_RESOLVED` | DNS: resolver, filtering, atau domain diblokir |
+| -106 | `ERR_INTERNET_DISCONNECTED` | Link atau gateway putus |
+| -102 | `ERR_CONNECTION_REFUSED` | Port ditolak; untuk semi daring cek layanan di server lokal atau rule reject |
+| -118 / -7 | `ERR_CONNECTION_TIMED_OUT` / `ERR_TIMED_OUT` | Paket di-drop: firewall, routing, NAT |
+| -109 | `ERR_ADDRESS_UNREACHABLE` | Tidak ada rute: routing atau VLAN |
+| -101 | `ERR_CONNECTION_RESET` | Direset middlebox (IPS/proxy) atau server kelebihan beban |
+| -130 / -111 | `ERR_PROXY_CONNECTION_FAILED` / `ERR_TUNNEL_CONNECTION_FAILED` | Masalah proxy sistem |
+
+Error sertifikat (`ERR_CERT_*`) jarang jadi penyebab di browser ini karena pengecekan sertifikat dimatikan.
+
+### 12.4 Interval: jangan pegang satu angka
+
+- JSON konfigurasi (terlihat di log): `HeartInterval` 600000 ms, `ImageInterval`/`StatusInterval`/`PesanInterval` 300000 ms.
+- `*.exe.config`: `HeartInterval` 60000 ms.
+- Log runtime satu sesi menunjukkan polling gagal tiap sekitar 30 detik.
+
+Nilai efektif polling dibaca `main.js` dari `setting_exambro.json`, jadi bisa berbeda dari angka di sisi .NET. Ukur dari log atau packet capture.
+
+### 12.5 Diagnosa berurutan
+
+1. **Semua klien atau satu klien?** Semua klien berarti gateway, DNS, atau upstream. Satu klien berarti NIC, proxy, DNS lokal, atau jam.
+2. **DNS:** resolve semua FQDN di 12.1 dari klien yang bermasalah.
+3. **TCP 443:** uji ke tiap tujuan, termasuk `192.168.0.200` untuk semi daring.
+4. **Proxy:** cocokkan pengaturan proxy sistem dengan variabel lingkungan `HTTP(S)_PROXY`.
+5. **Sisi server:** status 500 atau server lokal tidak merespons bukan masalah jaringan klien.
+
+#### Windows (klien)
+
+```powershell
+Resolve-DnsName anbk-siswa.pusmendik.kemdikbud.go.id
+Resolve-DnsName smart-production.pusmendik.kemdikbud.go.id
+Resolve-DnsName anbk-webapi.pusmendik.kemdikbud.go.id
+Test-NetConnection anbk-siswa.pusmendik.kemdikbud.go.id -Port 443
+Test-NetConnection 192.168.0.200 -Port 443
+curl.exe -vkI https://smart-production.pusmendik.kemdikbud.go.id/
+netsh winhttp show proxy
+```
+
+#### MikroTik RouterOS
+
+```
+# nama yang dikueri klien (jika router jadi resolver DNS)
+/ip dns cache print where name~"pusmendik"
+
+# whitelist berbasis FQDN
+/ip firewall address-list add list=exambro address=anbk-siswa.pusmendik.kemdikbud.go.id
+/ip firewall address-list add list=exambro address=smart-production.pusmendik.kemdikbud.go.id
+/ip firewall address-list add list=exambro address=anbk-webapi.pusmendik.kemdikbud.go.id
+
+# koneksi aktif dari klien tertentu
+/ip firewall connection print where src-address~"192.168.x.x"
+
+# tangkap paket klien selama simulasi
+/tool sniffer quick ip-address=192.168.x.x port=443
+```
+
+Karena domain ujian sudah muncul di `kemendikdasmen.go.id`, tambahkan juga padanan domain itu dan cek lewat DNS cache apakah host API ikut berpindah.
+
+### 12.6 Yang belum bisa dipastikan secara statis
+
+- Endpoint cek update dan upload snapshot webcam (kode .NET diobfuskasi). Cara melengkapi: catat FQDN lewat `/ip dns cache` dan sniffer saat simulasi (start aplikasi, login, satu siklus snapshot).
+- Apakah host `smart-production` dan `anbk-webapi` juga punya padanan `kemendikdasmen.go.id`. Verifikasi lewat DNS log.
+- Hipotesis untuk PC lama (Win 7/8): launcher .NET berjalan di mode kompatibilitas runtime 4.0, sehingga TLS 1.2 bisa tidak aktif. Jika launcher gagal terhubung padahal browser biasa bisa, periksa dukungan TLS 1.2 di OS. Belum diverifikasi.
